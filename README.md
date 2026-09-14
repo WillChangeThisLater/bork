@@ -1,23 +1,23 @@
-# break
+# bork
 
-`break` does what it says: it breaks things. Point it at a git repo and it
+`bork` does what it says: it breaks things. Point it at a git repo and it
 spawns a swarm of hostile AI agents whose only job is to find real,
 demonstrable ways the code fails — then reports what they broke.
 
 ```
 $ cd ~/repos/myproject
-$ break --last-commit
-[break] target: myproject @ diff HEAD~1..HEAD (worktree at a1b2c3d4e5f6)
-[break] triage: analyzing /home/paul/repos/myproject ...
-[break] hunt plan
+$ bork --last-commit
+[bork] target: myproject @ diff HEAD~1..HEAD (worktree at a1b2c3d4e5f6)
+[bork] triage: analyzing /home/paul/repos/myproject ...
+[bork] hunt plan
 agent   bug class                   focus
 ------------------------------------------------------------------------------
 #1      silent-fail-open            src/decide.go error/cancel paths
 #2      zero-value-keep             src/decide.go unmarshalling
 #3      prompt-size-and-injection   src/decide.go prompt construction
-[break] run: 20260914-144915-myproject  (3 hunters)
-[break] spawning 3 hunters (timeout 15m each) ...
-[break] 11 finding(s) — details in ~/.break/runs/20260914-144915-myproject/findings/
+[bork] run: 20260914-144915-myproject  (3 hunters)
+[bork] spawning 3 hunters (timeout 15m each) ...
+[bork] 11 finding(s) — details in ~/.bork/runs/20260914-144915-myproject/findings/
   1. [high/VERIFIED] huge-payload-kills-server.md
      ...
 ```
@@ -43,7 +43,7 @@ Two principles drive the design:
   *executed* something that crashed, hung, or produced wrong output.
   Reasoned-only bugs are marked as suspected.
 - **The ledger.** Every run's findings are recorded per-repo
-  (`~/.break/ledger/`) and fed back into future runs: triage is told not to
+  (`~/.bork/ledger/`) and fed back into future runs: triage is told not to
   re-propose known classes, hunters are told to find *new* breakage or
   *escalate* known findings — or, if a known bug looks fixed, to verify the
   fix (`severity: info`). Repeated runs on the same repo spiral outward
@@ -52,43 +52,43 @@ Two principles drive the design:
 ## Install
 
 ```bash
-git clone https://github.com/WillChangeThisLater/break && cd break
-ln -s $PWD/bin/break ~/.local/bin/break
+git clone https://github.com/WillChangeThisLater/bork && cd bork
+ln -s $PWD/bin/bork ~/.local/bin/bork
 ```
 
-**Note:** `break` collides with the bash/zsh builtin of the same name, which
-shadows PATH lookups. If `break -h` does nothing, add to your `~/.zshrc`:
+**Note:** `bork` collides with the bash/zsh builtin of the same name, which
+shadows PATH lookups. If `bork -h` does nothing, add to your `~/.zshrc`:
 
 ```zsh
-break() { "$HOME/.local/bin/break" "$@"; }
+bork() { "$HOME/.local/bin/bork" "$@"; }
 ```
 
 Requires [pi](https://github.com/earendil-works/pi) (any configured model
-provider) and git. State lives in `~/.break/` — worktrees, runs, findings,
+provider) and git. State lives in `~/.bork/` — worktrees, runs, findings,
 ledger — nothing is written into the target repo.
 
 ## Usage
 
 ```bash
-break                            # cwd repo, HEAD working tree
-break ~/repos/somerepo           # explicit repo
-break --last-commit              # attack what the last commit changed
-break --diff main..HEAD          # attack a range (worktree at the range end)
-break --commit <sha>             # attack the repo at a commit (own worktree)
+bork                            # cwd repo, HEAD working tree
+bork ~/repos/somerepo           # explicit repo
+bork --last-commit              # attack what the last commit changed
+bork --diff main..HEAD          # attack a range (worktree at the range end)
+bork --commit <sha>             # attack the repo at a commit (own worktree)
 
-break "focus on the streaming parser, try malformed inputs"   # prompt steering
-break --n 2                      # few hunters: triage targets the most pressing classes
-break --n 100                    # swarm: up to 12 classes, extras round-robin generic briefs
-break --classes 8                # decouple class count from hunter count
-break --fresh                    # ignore the known-findings ledger
-break --ledger                   # print what's already been surfaced
-break --model 'a,b'              # round-robin models across hunters
+bork "focus on the streaming parser, try malformed inputs"   # prompt steering
+bork --n 2                      # few hunters: triage targets the most pressing classes
+bork --n 100                    # swarm: up to 12 classes, extras round-robin generic briefs
+bork --classes 8                # decouple class count from hunter count
+bork --fresh                    # ignore the known-findings ledger
+bork --ledger                   # print what's already been surfaced
+bork --model 'a,b'              # round-robin models across hunters
 
-break --report <run-id>          # re-show a run's findings
-break --list                     # list runs
+bork --report <run-id>          # re-show a run's findings
+bork --list                     # list runs
 ```
 
-Findings land in `~/.break/runs/<run-id>/findings/*.md` with severity,
+Findings land in `~/.bork/runs/<run-id>/findings/*.md` with severity,
 verified status, exact repro commands, and a suggested fix. Exit code `1`
 means something broke; `0` means the repo held up (this round).
 

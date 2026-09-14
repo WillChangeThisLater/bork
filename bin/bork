@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""break — spawn pi agents to find ways a repo breaks.
+"""bork — spawn pi agents to find ways a repo breaks.
 
 Pipeline:
   prep (worktree) -> triage (one pi agent classifies likely bug types)
@@ -21,10 +21,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-BREAK_HOME = Path(os.environ.get("BREAK_HOME", Path.home() / ".break"))
-RUNS_DIR = BREAK_HOME / "runs"
-WORKTREES_DIR = BREAK_HOME / "worktrees"
-LEDGER_DIR = BREAK_HOME / "ledger"
+BORK_HOME = Path(os.environ.get("BORK_HOME", Path.home() / ".bork"))
+RUNS_DIR = BORK_HOME / "runs"
+WORKTREES_DIR = BORK_HOME / "worktrees"
+LEDGER_DIR = BORK_HOME / "ledger"
 
 # ---------------------------------------------------------------- helpers
 
@@ -43,7 +43,7 @@ def repo_root(path: Path) -> Path:
 
 
 def resolve_worktree(root: Path, commit: str | None, diff: str | None) -> tuple[Path, str]:
-    """Prepare a break-owned worktree. Returns (worktree_path, ref_description)."""
+    """Prepare a bork-owned worktree. Returns (worktree_path, ref_description)."""
     if not commit and not diff:
         return root, "HEAD (working tree)"
     if commit:
@@ -62,13 +62,13 @@ def resolve_worktree(root: Path, commit: str | None, diff: str | None) -> tuple[
 
 
 def die(msg):
-    print(f"break: error: {msg}", file=sys.stderr)
+    print(f"bork: error: {msg}", file=sys.stderr)
     sys.exit(2)
 
 
 # ---------------------------------------------------------------- triage
 
-TRIAGE_CONTRACT = """You are the triage stage of `break`, a tool that hunts for bugs.
+TRIAGE_CONTRACT = """You are the triage stage of `bork`, a tool that hunts for bugs.
 
 Your job: study this repository and decide which CLASSES of bugs are most
 likely present and worth dedicated hunting. Consider the language, the
@@ -108,7 +108,7 @@ TRIAGE_SCHEMA = {
 def run_triage(target: Path, focus: str | None, model: str | None, timeout: int,
                known: str = "", n_classes: int = 5) -> list[dict]:
     # structured output: force a validated JSON result instead of regex-parsing prose
-    schema_file = BREAK_HOME / "triage-schema.json"
+    schema_file = BORK_HOME / "triage-schema.json"
     schema_file.write_text(json.dumps(TRIAGE_SCHEMA))
     cmd = ["pi", "-p", "--no-session", "--schema", str(schema_file)]
     if model:
@@ -125,9 +125,9 @@ def run_triage(target: Path, focus: str | None, model: str | None, timeout: int,
             "class if a known bug looks plausibly-fixed):\n\n" + known + "\n"
         )
     cmd += ["--", prompt]
-    print(f"[break] triage: analyzing {target} ...")
+    print(f"[bork] triage: analyzing {target} ...")
     r = subprocess.run(cmd, cwd=target, capture_output=True, text=True, timeout=timeout * 60)
-    (BREAK_HOME / "triage-last.txt").write_text(r.stdout)
+    (BORK_HOME / "triage-last.txt").write_text(r.stdout)
     classes = parse_structured_triage(r.stdout)
     if classes:
         return classes
@@ -212,7 +212,7 @@ def extract_final_text(pi_json_output: str) -> str:
 # ---------------------------------------------------------------- ledger
 
 def ledger_path(root: Path) -> Path:
-    """Per-repo findings ledger: everything break has surfaced before."""
+    """Per-repo findings ledger: everything bork has surfaced before."""
     key = re.sub(r"\W+", "-", str(root).strip("/")).lower()
     return LEDGER_DIR / f"{key}.md"
 
@@ -234,7 +234,7 @@ def append_run_to_ledger(root: Path, run_id: str, findings: list[dict]):
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a") as f:
         if not p.exists() or p.stat().st_size == 0:
-            f.write(f"# Known break findings — {root}\n\n")
+            f.write(f"# Known bork findings — {root}\n\n")
         f.write(f"\n## {run_id} ({time.strftime('%Y-%m-%d')})\n\n")
         for fnd in findings:
             v = "verified" if fnd["verified"].lower().startswith("y") else "suspected"
@@ -248,7 +248,7 @@ def append_run_to_ledger(root: Path, run_id: str, findings: list[dict]):
 
 # ---------------------------------------------------------------- hunters
 
-HUNTER_CONTRACT = """You are a hostile bug-hunting agent spawned by `break`.
+HUNTER_CONTRACT = """You are a hostile bug-hunting agent spawned by `bork`.
 
 Your one job: find a REAL, demonstrable way this code breaks. You are not
 reviewing — you are attacking. Think like an adversary: malformed input,
@@ -304,7 +304,7 @@ def build_plan(classes: list[dict], n_hunters: int) -> list[dict]:
 
 
 def show_plan(plan: list[dict]):
-    print("\n[break] hunt plan")
+    print("\n[bork] hunt plan")
     print(f"{'agent':<8}{'bug class':<28}focus")
     print("-" * 78)
     for h in plan:
@@ -389,7 +389,7 @@ def load_findings(run_dir: Path) -> list[dict]:
 
 def print_report(run_dir: Path, plan: list[dict], hunter_results: list[dict]):
     findings = load_findings(run_dir)
-    print("\n[break] hunter results")
+    print("\n[bork] hunter results")
     for r in hunter_results:
         print(f"  #{r['id']} {r['kind']:<28} {r['status']:<14} "
               f"{r['findings']} finding(s) in {r['secs']}s")
@@ -398,7 +398,7 @@ def print_report(run_dir: Path, plan: list[dict], hunter_results: list[dict]):
         return 0
     order = {"high": 0, "medium": 1, "low": 2}
     findings.sort(key=lambda f: order.get(f["severity"], 3))
-    print(f"\n[break] {len(findings)} finding(s) — details in {run_dir}/findings/\n")
+    print(f"\n[bork] {len(findings)} finding(s) — details in {run_dir}/findings/\n")
     for i, f in enumerate(findings, 1):
         v = "VERIFIED" if f["verified"].lower().startswith("y") else "suspected"
         print(f"  {i}. [{f['severity']}/{v}] {f['file']}")
@@ -415,16 +415,16 @@ class Fmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFor
 
 def main():
     ap = argparse.ArgumentParser(
-    prog="break",
+    prog="bork",
     description=("Spawn hostile pi agents to find real, demonstrable ways a repo breaks.\n"
-                 "Triage -> hunt swarm -> verified findings. State lives in ~/.break/."),
+                 "Triage -> hunt swarm -> verified findings. State lives in ~/.bork/."),
     epilog=("examples:\n"
-            "  break                          attack cwd repo at HEAD\n"
-            "  break --last-commit            attack what the last commit changed\n"
-            "  break --diff main..HEAD        attack a range\n"
-            "  break --n 5 --timeout-mins 15  swarm of 5 hunters\n"
-            "  break 'focus on the parser, try malformed input'\n"
-            "  break --ledger                 show known findings\n"),
+            "  bork                          attack cwd repo at HEAD\n"
+            "  bork --last-commit            attack what the last commit changed\n"
+            "  bork --diff main..HEAD        attack a range\n"
+            "  bork --n 5 --timeout-mins 15  swarm of 5 hunters\n"
+            "  bork 'focus on the parser, try malformed input'\n"
+            "  bork --ledger                 show known findings\n"),
     formatter_class=Fmt)
     ap.add_argument("target", nargs="?", default=".", help="repo path (default: cwd)")
     ap.add_argument("prompt", nargs="?", default=None, help="free-text focus hint")
@@ -474,9 +474,9 @@ def main():
 
     wt, ref_desc = resolve_worktree(root, args.commit, args.diff)
     target = wt if wt != root else root
-    print(f"[break] target: {root.name} @ {ref_desc}")
+    print(f"[bork] target: {root.name} @ {ref_desc}")
     if wt != root:
-        print(f"[break] worktree: {wt}")
+        print(f"[bork] worktree: {wt}")
 
     n_classes = args.classes or (max(3, min(args.n, 12)) if args.n else 5)
     classes = run_triage(target, focus, args.model, args.timeout_mins,
@@ -492,17 +492,17 @@ def main():
         {"run_id": run_id, "repo": str(root), "ref": ref_desc, "target": str(target),
          "focus": focus, "classes": classes, "plan": plan}, indent=2))
     show_plan(plan)
-    print(f"\n[break] run: {run_id}  ({len(plan)} hunters)")
+    print(f"\n[bork] run: {run_id}  ({len(plan)} hunters)")
     models = [m.strip() for m in args.model.split(",")] if args.model else [None]
     for h in plan:
         h["model"] = models[(h["id"] - 1) % len(models)]
         print(f"  hunter #{h['id']} ({h['kind']}): model = {h['model'] or 'pi default'}")
     if args.dry_run:
-        print("[break] dry-run: stopping before spawn. Logs/triage: " + str(run_dir))
+        print("[bork] dry-run: stopping before spawn. Logs/triage: " + str(run_dir))
         return
 
     findings_dir.mkdir()
-    print(f"[break] spawning {len(plan)} hunters (timeout {args.timeout_mins}m each) ...\n")
+    print(f"[bork] spawning {len(plan)} hunters (timeout {args.timeout_mins}m each) ...\n")
     with __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(max_workers=len(plan)) as ex:
         known = "" if args.fresh else load_ledger(root)
         results = list(ex.map(lambda h: run_hunter(h, target, findings_dir, h["model"],
@@ -510,7 +510,7 @@ def main():
     (run_dir / "hunters.json").write_text(json.dumps(results, indent=2))
     findings = load_findings(run_dir)
     append_run_to_ledger(root, run_id, findings)
-    print(f"[break] run dir: {run_dir}")
+    print(f"[bork] run dir: {run_dir}")
     sys.exit(print_report(run_dir, plan, results))
 
 
