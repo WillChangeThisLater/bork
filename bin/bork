@@ -126,13 +126,20 @@ def run_triage(target: Path, focus: str | None, model: str | None, timeout: int,
         )
     cmd += ["--", prompt]
     print(f"[bork] triage: analyzing {target} ...")
-    r = subprocess.run(cmd, cwd=target, capture_output=True, text=True, timeout=timeout * 60)
-    (BORK_HOME / "triage-last.txt").write_text(r.stdout)
-    classes = parse_structured_triage(r.stdout)
-    if classes:
-        return classes
-    # fallback: old prose contract + regex parsing (pre---schema pi installs)
-    return parse_bugclasses(r.stdout)
+    for attempt in (1, 2):  # triage is a single point of failure: retry once
+        r = subprocess.run(cmd, cwd=target, capture_output=True, text=True,
+                           timeout=timeout * 60)
+        (BORK_HOME / "triage-last.txt").write_text(r.stdout)
+        (BORK_HOME / "triage-last.err").write_text(r.stderr)
+        classes = parse_structured_triage(r.stdout)
+        if classes:
+            return classes
+        # fallback: old prose contract + regex parsing (pre---schema pi installs)
+        classes = parse_bugclasses(r.stdout)
+        if classes:
+            return classes
+        print(f"[bork] triage attempt {attempt} produced no bug classes; retrying")
+    return []
 
 
 def parse_structured_triage(pi_json_output: str) -> list[dict]:
