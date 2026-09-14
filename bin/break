@@ -85,12 +85,37 @@ BUGCLASSES:
 """
 
 
+TRIAGE_SCHEMA = {
+    "type": "object",
+    "required": ["classes"],
+    "properties": {
+        "classes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "brief", "where"],
+                "properties": {
+                    "name": {"type": "string", "description": "short-slug-name"},
+                    "brief": {"type": "string", "description": "one-sentence mission for a hunter agent"},
+                    "where": {"type": "string", "description": "files/areas of the repo to focus on"},
+                },
+            },
+        },
+    },
+}
+
+
 def run_triage(target: Path, focus: str | None, model: str | None, timeout: int,
                known: str = "", n_classes: int = 5) -> list[dict]:
-    cmd = ["pi", "-p", "--no-session", "--mode", "json"]
+    # structured output: force a validated JSON result instead of regex-parsing prose
+    schema_file = BREAK_HOME / "triage-schema.json"
+    schema_file.write_text(json.dumps(TRIAGE_SCHEMA))
+    cmd = ["pi", "-p", "--no-session", "--schema", str(schema_file)]
     if model:
         cmd += ["--model", model]
     prompt = TRIAGE_CONTRACT.format(n_classes=n_classes) + f"\nRepository to analyze: {target}\n"
+    prompt += (f"\nReturn exactly {n_classes} entries in the classes array, most promising "
+               "first.\n")
     if focus:
         prompt += f"User's focus hint (weight it heavily): {focus}\n"
     if known:
@@ -103,7 +128,34 @@ def run_triage(target: Path, focus: str | None, model: str | None, timeout: int,
     print(f"[break] triage: analyzing {target} ...")
     r = subprocess.run(cmd, cwd=target, capture_output=True, text=True, timeout=timeout * 60)
     (BREAK_HOME / "triage-last.txt").write_text(r.stdout)
+    classes = parse_structured_triage(r.stdout)
+    if classes:
+        return classes
+    # fallback: old prose contract + regex parsing (pre---schema pi installs)
     return parse_bugclasses(r.stdout)
+
+
+def parse_structured_triage(pi_json_output: str) -> list[dict]:
+    """Extract the schema-validated JSON emitted by pi --schema (print mode pipes
+    compact JSON to stdout; fall back to scanning lines for a classes object)."""
+    candidates = [pi_json_output.strip()] + [l.strip() for l in pi_json_output.splitlines()]
+    for cand in candidates:
+        if not (cand.startswith("{") and cand.endswith("}")):
+            continue
+        try:
+            obj = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj.get("classes"), list):
+            out = []
+            for c in obj["classes"]:
+                if isinstance(c, dict) and c.get("name") and c.get("brief"):
+                    out.append({"name": str(c["name"]).strip(),
+                                "brief": str(c["brief"]).strip(),
+                                "where": str(c.get("where", "")).strip()})
+            if out:
+                return out
+    return []
 
 
 def parse_bugclasses(output: str) -> list[dict]:
