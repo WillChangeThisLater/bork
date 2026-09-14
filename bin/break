@@ -24,6 +24,7 @@ from pathlib import Path
 BREAK_HOME = Path(os.environ.get("BREAK_HOME", Path.home() / ".break"))
 RUNS_DIR = BREAK_HOME / "runs"
 WORKTREES_DIR = BREAK_HOME / "worktrees"
+LEDGER_DIR = BREAK_HOME / "ledger"
 
 # ---------------------------------------------------------------- helpers
 
@@ -84,13 +85,20 @@ BUGCLASSES:
 """
 
 
-def run_triage(target: Path, focus: str | None, model: str | None, timeout: int) -> list[dict]:
+def run_triage(target: Path, focus: str | None, model: str | None, timeout: int,
+               known: str = "") -> list[dict]:
     cmd = ["pi", "-p", "--no-session", "--mode", "json"]
     if model:
         cmd += ["--model", model]
     prompt = TRIAGE_CONTRACT + f"\nRepository to analyze: {target}\n"
     if focus:
         prompt += f"User's focus hint (weight it heavily): {focus}\n"
+    if known:
+        prompt += (
+            "\nKNOWN FINDINGS from previous runs (do not re-propose bug classes "
+            "that only re-find these; prioritize NEW surfaces, or a verifier "
+            "class if a known bug looks plausibly-fixed):\n\n" + known + "\n"
+        )
     cmd += ["--", prompt]
     print(f"[break] triage: analyzing {target} ...")
     r = subprocess.run(cmd, cwd=target, capture_output=True, text=True, timeout=timeout * 60)
@@ -149,6 +157,43 @@ def extract_final_text(pi_json_output: str) -> str:
     return texts[-1] if texts else pi_json_output
 
 
+# ---------------------------------------------------------------- ledger
+
+def ledger_path(root: Path) -> Path:
+    """Per-repo findings ledger: everything break has surfaced before."""
+    key = re.sub(r"\W+", "-", str(root).strip("/")).lower()
+    return LEDGER_DIR / f"{key}.md"
+
+
+def load_ledger(root: Path) -> str:
+    p = ledger_path(root)
+    if not p.exists():
+        return ""
+    text = p.read_text().strip()
+    if not text:
+        return ""
+    return text
+
+
+def append_run_to_ledger(root: Path, run_id: str, findings: list[dict]):
+    if not findings:
+        return
+    p = ledger_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a") as f:
+        if not p.exists() or p.stat().st_size == 0:
+            f.write(f"# Known break findings — {root}\n\n")
+        f.write(f"\n## {run_id} ({time.strftime('%Y-%m-%d')})\n\n")
+        for fnd in findings:
+            v = "verified" if fnd["verified"].lower().startswith("y") else "suspected"
+            f.write(f"### {fnd['file']}\n")
+            f.write(f"severity: {fnd['severity']} ({v})\n")
+            if fnd["repro"]:
+                f.write(f"repro: {fnd['repro']}\n")
+            notes = fnd["notes"][:600]
+            f.write(f"{notes}\n")
+
+
 # ---------------------------------------------------------------- hunters
 
 HUNTER_CONTRACT = """You are a hostile bug-hunting agent spawned by `break`.
@@ -171,7 +216,7 @@ Rules:
     notes: <what breaks, why, suggested fix>
   Use plain text after those headers. No findings that you could not at
   least partially demonstrate.
-- Push nothing, commit nothing, fix nothing. Reports only.
+{known_section}- Push nothing, commit nothing, fix nothing. Reports only.
 - Budget your time; end when you have covered your brief or hit dead ends.
 
 End your final message with exactly one line:
@@ -215,9 +260,24 @@ def show_plan(plan: list[dict]):
 
 
 def run_hunter(h: dict, target: Path, findings_dir: Path, model: str | None,
-               timeout: int, focus: str | None) -> dict:
+               timeout: int, focus: str | None, known: str = "") -> dict:
     findings_dir.mkdir(parents=True, exist_ok=True)
-    prompt = HUNTER_CONTRACT.format(target=target, findings_dir=findings_dir)
+    if model and any(k in model.lower() for k in ("llama", "ollama", "local")):
+        prompt += ("\nNOTE: you are running on a LOCAL model shared concurrently with other "
+                   "hunter agents right now. Expect queuing/slow responses; don't panic or "
+                   "restart on slowness, pace yourself, and prefer fewer, higher-value "
+                   "actions over many rapid-fire calls.\n")
+    known_section = ""
+    if known:
+        known_section = (
+            "\nKnown findings already surfaced in previous runs — do NOT re-report "
+            "these as-is. Either find NEW breakage, or escalate a known one "
+            "(deeper repro, worse severity, more impact). If a known bug looks "
+            "fixed in the current code, say so in a finding file marked "
+            "severity: info.\n\n" + known + "\n"
+        )
+    prompt = HUNTER_CONTRACT.format(target=target, findings_dir=findings_dir,
+                                    known_section=known_section)
     prompt += f"\nYour assigned attack brief ({h['kind']}):\n  {h['brief']}\n"
     if h.get("where"):
         prompt += f"Focus areas: {h['where']}\n"
@@ -306,9 +366,12 @@ def main():
     ap.add_argument("--diff", default=None, help="attack what RANGE changed, e.g. main..HEAD")
     ap.add_argument("--last-commit", action="store_true", help="sugar for --diff HEAD~1..HEAD")
     ap.add_argument("--n", type=int, default=0, help="hunter count (default: one per bug class)")
-    ap.add_argument("--model", default=None, help="pi model pattern (default: pi's default)")
+    ap.add_argument("--model", default=None,
+                    help="pi model pattern(s), comma-separated = round-robin across hunters")
     ap.add_argument("--timeout-mins", type=int, default=20, help="per-agent timeout (default 20)")
     ap.add_argument("--dry-run", action="store_true", help="show plan, spawn nothing")
+    ap.add_argument("--fresh", action="store_true", help="ignore known-findings ledger")
+    ap.add_argument("--ledger", action="store_true", help="print the repo's known-findings ledger")
     ap.add_argument("--report", default=None, metavar="RUN_ID", help="re-show a past run")
     ap.add_argument("--list", action="store_true", help="list past runs")
     args = ap.parse_args()
@@ -317,6 +380,10 @@ def main():
         if RUNS_DIR.exists():
             for d in sorted(RUNS_DIR.iterdir()):
                 print(d.name)
+        return
+    if args.ledger:
+        p = ledger_path(Path(args.target).resolve())
+        print(p.read_text() if p.exists() else f"no ledger yet: {p}")
         return
     if args.report:
         run_dir = RUNS_DIR / args.report
@@ -341,7 +408,8 @@ def main():
     if wt != root:
         print(f"[break] worktree: {wt}")
 
-    classes = run_triage(target, focus, args.model, args.timeout_mins)
+    classes = run_triage(target, focus, args.model, args.timeout_mins,
+                         known="" if args.fresh else load_ledger(root))
     if not classes:
         die("triage produced no bug classes (check model output)")
     n = args.n or len(classes)
@@ -351,6 +419,10 @@ def main():
          "focus": focus, "classes": classes, "plan": plan}, indent=2))
     show_plan(plan)
     print(f"\n[break] run: {run_id}  ({len(plan)} hunters)")
+    models = [m.strip() for m in args.model.split(",")] if args.model else [None]
+    for h in plan:
+        h["model"] = models[(h["id"] - 1) % len(models)]
+        print(f"  hunter #{h['id']} ({h['kind']}): model = {h['model'] or 'pi default'}")
     if args.dry_run:
         print("[break] dry-run: stopping before spawn. Logs/triage: " + str(run_dir))
         return
@@ -358,9 +430,12 @@ def main():
     findings_dir.mkdir()
     print(f"[break] spawning {len(plan)} hunters (timeout {args.timeout_mins}m each) ...\n")
     with __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(max_workers=len(plan)) as ex:
-        results = list(ex.map(lambda h: run_hunter(h, target, findings_dir, args.model,
-                                                   args.timeout_mins, focus), plan))
+        known = "" if args.fresh else load_ledger(root)
+        results = list(ex.map(lambda h: run_hunter(h, target, findings_dir, h["model"],
+                                                   args.timeout_mins, focus, known), plan))
     (run_dir / "hunters.json").write_text(json.dumps(results, indent=2))
+    findings = load_findings(run_dir)
+    append_run_to_ledger(root, run_id, findings)
     print(f"[break] run dir: {run_dir}")
     sys.exit(print_report(run_dir, plan, results))
 
