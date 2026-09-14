@@ -293,6 +293,22 @@ EXTRA_BRIEFS = [
 ]
 
 
+def warm_build(target: Path):
+    """Pre-build the target so hunters don't burn their whole budget inside a
+    single long `bash` tool call (e.g. cold cargo builds). Dumb and best-effort."""
+    warmers = []
+    if (target / "Cargo.toml").exists():
+        warmers = [["cargo", "build"]]
+    elif (target / "Makefile").exists():
+        warmers = [["make", "-j4"]]
+    for cmd in warmers:
+        print(f"[bork] warming build cache: {' '.join(cmd)} ...")
+        try:
+            subprocess.run(cmd, cwd=target, capture_output=True, timeout=1200)
+        except subprocess.TimeoutExpired:
+            pass  # hunter will finish or adapt; cache is at least partially warm
+
+
 def build_plan(classes: list[dict], n_hunters: int) -> list[dict]:
     """One hunter per triage class; extras round-robin with generic briefs."""
     plan = []
@@ -481,6 +497,8 @@ def main():
 
     wt, ref_desc = resolve_worktree(root, args.commit, args.diff)
     target = wt if wt != root else root
+    if not args.dry_run:
+        warm_build(target)
     print(f"[bork] target: {root.name} @ {ref_desc}")
     if wt != root:
         print(f"[bork] worktree: {wt}")
