@@ -81,16 +81,16 @@ BUGCLASSES:
 - name: <short-slug-name>
   brief: <one-sentence mission for a hunter agent: what to look for and how to attack it>
   where: <files/areas of the repo to focus on>
-(3 to 6 entries, most promising first. Use real newlines, not \\n escapes. No text after the block.)
+({n_classes} entries, most promising first. Use real newlines, not \\n escapes. No text after the block.)
 """
 
 
 def run_triage(target: Path, focus: str | None, model: str | None, timeout: int,
-               known: str = "") -> list[dict]:
+               known: str = "", n_classes: int = 5) -> list[dict]:
     cmd = ["pi", "-p", "--no-session", "--mode", "json"]
     if model:
         cmd += ["--model", model]
-    prompt = TRIAGE_CONTRACT + f"\nRepository to analyze: {target}\n"
+    prompt = TRIAGE_CONTRACT.format(n_classes=n_classes) + f"\nRepository to analyze: {target}\n"
     if focus:
         prompt += f"User's focus hint (weight it heavily): {focus}\n"
     if known:
@@ -365,7 +365,10 @@ def main():
     ap.add_argument("--commit", default=None, help="attack repo at this commit (own worktree)")
     ap.add_argument("--diff", default=None, help="attack what RANGE changed, e.g. main..HEAD")
     ap.add_argument("--last-commit", action="store_true", help="sugar for --diff HEAD~1..HEAD")
-    ap.add_argument("--n", type=int, default=0, help="hunter count (default: one per bug class)")
+    ap.add_argument("--n", type=int, default=0,
+                    help="hunter count (default: one per bug class)")
+    ap.add_argument("--classes", type=int, default=0,
+                    help="bug classes for triage to hunt (default: clamp(--n, 3, 12); else 5)")
     ap.add_argument("--model", default=None,
                     help="pi model pattern(s), comma-separated = round-robin across hunters")
     ap.add_argument("--timeout-mins", type=int, default=20, help="per-agent timeout (default 20)")
@@ -408,11 +411,15 @@ def main():
     if wt != root:
         print(f"[break] worktree: {wt}")
 
+    n_classes = args.classes or (max(3, min(args.n, 12)) if args.n else 5)
     classes = run_triage(target, focus, args.model, args.timeout_mins,
-                         known="" if args.fresh else load_ledger(root))
+                         known="" if args.fresh else load_ledger(root),
+                         n_classes=n_classes)
     if not classes:
         die("triage produced no bug classes (check model output)")
     n = args.n or len(classes)
+    if len(classes) > n:
+        classes = classes[:n]  # low hunter count: focus on the most pressing classes
     plan = build_plan(classes, n)
     (run_dir / "plan.json").write_text(json.dumps(
         {"run_id": run_id, "repo": str(root), "ref": ref_desc, "target": str(target),
