@@ -52,8 +52,15 @@ Two principles drive the design:
 ## Install
 
 ```bash
-git clone <this repo> && cd break
-sudo ln -s $PWD/bin/break /usr/local/bin/break   # or add bin/ to PATH
+git clone https://github.com/WillChangeThisLater/break && cd break
+ln -s $PWD/bin/break ~/.local/bin/break
+```
+
+**Note:** `break` collides with the bash/zsh builtin of the same name, which
+shadows PATH lookups. If `break -h` does nothing, add to your `~/.zshrc`:
+
+```zsh
+break() { "$HOME/.local/bin/break" "$@"; }
 ```
 
 Requires [pi](https://github.com/earendil-works/pi) (any configured model
