@@ -409,8 +409,23 @@ def print_report(run_dir: Path, plan: list[dict], hunter_results: list[dict]):
 
 # ---------------------------------------------------------------- main
 
+class Fmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    pass
+
+
 def main():
-    ap = argparse.ArgumentParser(prog="break", description="Spawn pi agents to break a repo.")
+    ap = argparse.ArgumentParser(
+    prog="break",
+    description=("Spawn hostile pi agents to find real, demonstrable ways a repo breaks.\n"
+                 "Triage -> hunt swarm -> verified findings. State lives in ~/.break/."),
+    epilog=("examples:\n"
+            "  break                          attack cwd repo at HEAD\n"
+            "  break --last-commit            attack what the last commit changed\n"
+            "  break --diff main..HEAD        attack a range\n"
+            "  break --n 5 --timeout-mins 15  swarm of 5 hunters\n"
+            "  break 'focus on the parser, try malformed input'\n"
+            "  break --ledger                 show known findings\n"),
+    formatter_class=Fmt)
     ap.add_argument("target", nargs="?", default=".", help="repo path (default: cwd)")
     ap.add_argument("prompt", nargs="?", default=None, help="free-text focus hint")
     ap.add_argument("--focus", default=None, help="focus hint (same as positional prompt)")
