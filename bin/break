@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""break — spawn pi agents to find ways a repo breaks.
+
+Pipeline:
+  prep (worktree) -> triage (one pi agent classifies likely bug types)
+  -> plan (one hunter per class, --n extras round-robined)
+  -> spawn hunters in parallel -> harvest findings -> report
+
+Orchestration layer has no LLM in it: all intelligence lives in the spawned
+pi sessions. Verdicts/structude blocks are parsed from their final output.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+BREAK_HOME = Path(os.environ.get("BREAK_HOME", Path.home() / ".break"))
+RUNS_DIR = BREAK_HOME / "runs"
+WORKTREES_DIR = BREAK_HOME / "worktrees"
+
+# ---------------------------------------------------------------- helpers
+
+def sh(cmd, cwd=None, check=True, capture=True):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=capture, text=True)
+    if check and r.returncode != 0:
+        die(f"command failed: {shlex.join(cmd)}\n{r.stderr.strip()}")
+    return r
+
+
+def repo_root(path: Path) -> Path:
+    r = sh(["git", "-C", str(path), "rev-parse", "--show-toplevel"], check=False)
+    if r.returncode != 0:
+        die(f"{path} is not inside a git repo")
+    return Path(r.stdout.strip())
+
+
+def resolve_worktree(root: Path, commit: str | None, diff: str | None) -> tuple[Path, str]:
+    """Prepare a break-owned worktree. Returns (worktree_path, ref_description)."""
+    if not commit and not diff:
+        return root, "HEAD (working tree)"
+    if commit:
+        sha = sh(["git", "-C", str(root), "rev-parse", commit]).stdout.strip()[:12]
+        wt = WORKTREES_DIR / f"{root.name}-{sha}"
+        if not wt.exists():
+            sh(["git", "-C", str(root), "worktree", "add", "--detach", str(wt), sha])
+        return wt, f"commit {sha}"
+    # diff mode: worktree at the range's end; the diff itself is passed to hunters
+    end = diff.split("..")[-1] or "HEAD"
+    sha = sh(["git", "-C", str(root), "rev-parse", end]).stdout.strip()[:12]
+    wt = WORKTREES_DIR / f"{root.name}-{sha}"
+    if not wt.exists():
+        sh(["git", "-C", str(root), "worktree", "add", "--detach", str(wt), sha])
+    return wt, f"diff {diff} (worktree at {sha})"
+
+
+def die(msg):
+    print(f"break: error: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+# ---------------------------------------------------------------- triage
+
+TRIAGE_CONTRACT = """You are the triage stage of `break`, a tool that hunts for bugs.
+
+Your job: study this repository and decide which CLASSES of bugs are most
+likely present and worth dedicated hunting. Consider the language, the
+project's domain, its error handling, concurrency, parsing, build system,
+test coverage, and anything the code smells like it gets wrong.
+
+You MUST end your final message with exactly this block:
+
+BUGCLASSES:
+- name: <short-slug-name>
+  brief: <one-sentence mission for a hunter agent: what to look for and how to attack it>
+  where: <files/areas of the repo to focus on>
+(3 to 6 entries, most promising first. Use real newlines, not \\n escapes. No text after the block.)
+"""
+
+
+def run_triage(target: Path, focus: str | None, model: str | None, timeout: int) -> list[dict]:
+    cmd = ["pi", "-p", "--no-session", "--mode", "json"]
+    if model:
+        cmd += ["--model", model]
+    prompt = TRIAGE_CONTRACT + f"\nRepository to analyze: {target}\n"
+    if focus:
+        prompt += f"User's focus hint (weight it heavily): {focus}\n"
+    cmd += ["--", prompt]
+    print(f"[break] triage: analyzing {target} ...")
+    r = subprocess.run(cmd, cwd=target, capture_output=True, text=True, timeout=timeout * 60)
+    (BREAK_HOME / "triage-last.txt").write_text(r.stdout)
+    return parse_bugclasses(r.stdout)
+
+
+def parse_bugclasses(output: str) -> list[dict]:
+    """Parse BUGCLASSES block from pi json-mode output (or plain text)."""
+    text = extract_final_text(output)
+    text = text.replace("\\n", "\n")  # models sometimes emit literal backslash-n
+    m = re.search(r"BUGCLASSES:[^\S\n]*\n(.*)", text, re.S)
+    if not m:
+        return []
+    classes, cur = [], None
+    for line in m.group(1).splitlines():
+        lm = re.match(r"[ \t]*[-\u2022]?[ \t]*name:[ \t]*(.+)", line)
+        if lm:
+            if cur:
+                classes.append(cur)
+            cur = {"name": lm.group(1).strip().strip("`"), "brief": "", "where": ""}
+            continue
+        if cur is None:
+            continue
+        bm = re.match(r"[ \t]+brief:[ \t]*(.*)", line)
+        if bm:
+            cur["brief"] = (cur["brief"] + " " + bm.group(1).strip()).strip()
+            continue
+        wm = re.match(r"[ \t]+where:[ \t]*(.*)", line)
+        if wm:
+            cur["where"] = (cur["where"] + " " + wm.group(1).strip()).strip()
+            continue
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("-", "#")):
+            cur["brief"] += " " + stripped
+    if cur:
+        classes.append(cur)
+    return classes
+
+
+def extract_final_text(pi_json_output: str) -> str:
+    """pi --mode json emits one JSON object per line; get the final assistant text."""
+    texts = []
+    for line in pi_json_output.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") == "message_end" and obj.get("message", {}).get("role") == "assistant":
+            for part in obj["message"].get("content", []):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    texts.append(part.get("text", ""))
+    return texts[-1] if texts else pi_json_output
+
+
+# ---------------------------------------------------------------- hunters
+
+HUNTER_CONTRACT = """You are a hostile bug-hunting agent spawned by `break`.
+
+Your one job: find a REAL, demonstrable way this code breaks. You are not
+reviewing — you are attacking. Think like an adversary: malformed input,
+unhandled edge cases, race conditions, resource exhaustion, API misuse,
+error paths nobody tested.
+
+Rules:
+- You operate ONLY inside {target}. Never touch the user's checkout or other repos.
+- Figure out how to build it yourself (Makefile, cargo, meson, package.json, ...).
+- A finding counts as VERIFIED only if you EXECUTED something that crashed,
+  hung, produced wrong output, or otherwise misbehaved. Reasoned-only bugs
+  must be marked verified: no.
+- Write each finding as a file in {findings_dir}/ named <slug>.md with:
+    severity: high|medium|low
+    verified: yes|no
+    repro: <exact command(s) that demonstrate the bug>
+    notes: <what breaks, why, suggested fix>
+  Use plain text after those headers. No findings that you could not at
+  least partially demonstrate.
+- Push nothing, commit nothing, fix nothing. Reports only.
+- Budget your time; end when you have covered your brief or hit dead ends.
+
+End your final message with exactly one line:
+STATUS: FOUND (<n> findings)     — if you wrote finding files
+STATUS: NOTHING_FOUND            — if your attacks all came up clean
+"""
+
+# Generic attack briefs used for --n extras, round-robined after the
+# triage classes. Each hunter gets triage class first, then these.
+EXTRA_BRIEFS = [
+    "Fuzz input parsing: throw malformed, empty, huge, and adversarial inputs at every input path you can find.",
+    "Attack error handling: force failure paths (missing files, bad env, full disk sim, network errors) and see what leaks, crashes, or corrupts.",
+    "Hunt concurrency and resource bugs: races, unbounded growth, fd/memory leaks, missing cleanup on early exit.",
+    "Abuse the CLI/API surface: wrong argument types, impossible combinations, unicode, extremely long values, repeated invocation.",
+]
+
+
+def build_plan(classes: list[dict], n_hunters: int) -> list[dict]:
+    """One hunter per triage class; extras round-robin with generic briefs."""
+    plan = []
+    for i, c in enumerate(classes[:n_hunters]):
+        plan.append({"id": i + 1, "kind": c["name"], "brief": c["brief"], "where": c.get("where", "")})
+    generic = [EXTRA_BRIEFS[i % len(EXTRA_BRIEFS)] for i in range(max(0, n_hunters - len(classes)))]
+    for j, brief in enumerate(generic):
+        cls = classes[(len(plan)) % len(classes)] if classes else {}
+        plan.append({
+            "id": len(plan) + 1,
+            "kind": (cls.get("name", "general") + "-extra") if cls else "general",
+            "brief": brief,
+            "where": cls.get("where", ""),
+        })
+    return plan
+
+
+def show_plan(plan: list[dict]):
+    print("\n[break] hunt plan")
+    print(f"{'agent':<8}{'bug class':<28}focus")
+    print("-" * 78)
+    for h in plan:
+        print(f"#{h['id']:<7}{h['kind'][:27]:<28}{(h['where'] or h['brief'])[:46]}")
+
+
+def run_hunter(h: dict, target: Path, findings_dir: Path, model: str | None,
+               timeout: int, focus: str | None) -> dict:
+    findings_dir.mkdir(parents=True, exist_ok=True)
+    prompt = HUNTER_CONTRACT.format(target=target, findings_dir=findings_dir)
+    prompt += f"\nYour assigned attack brief ({h['kind']}):\n  {h['brief']}\n"
+    if h.get("where"):
+        prompt += f"Focus areas: {h['where']}\n"
+    if focus:
+        prompt += f"User's focus hint: {focus}\n"
+    cmd = ["pi", "-p", "--no-session", "--mode", "json"]
+    if model:
+        cmd += ["--model", model]
+    cmd += ["--", prompt]
+    log = findings_dir.parent / f"hunter-{h['id']}.log"
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, cwd=target, capture_output=True, text=True, timeout=timeout * 60)
+        out = r.stdout
+        status = "timeout" if False else parse_status(out)
+    except subprocess.TimeoutExpired:
+        out = ""
+        status = "TIMEOUT"
+    log.write_text(out or "(no output)")
+    n = len(list(findings_dir.glob("*.md"))) if findings_dir.exists() else 0
+    return {"id": h["id"], "kind": h["kind"], "status": status, "findings": n,
+            "secs": int(time.time() - t0)}
+
+
+def parse_status(pi_json_output: str) -> str:
+    text = extract_final_text(pi_json_output)
+    m = re.search(r"STATUS:\s*(FOUND|NOTHING_FOUND)", text)
+    return m.group(1) if m else "NO_STATUS"
+
+
+# ---------------------------------------------------------------- findings
+
+def load_findings(run_dir: Path) -> list[dict]:
+    findings = []
+    for f in sorted((run_dir / "findings").glob("*.md")):
+        d = {"file": f.name, "severity": "?", "verified": "?", "repro": "", "notes": ""}
+        section = None
+        for line in f.read_text().splitlines():
+            m = re.match(r"(severity|verified|repro|notes):\s*(.*)", line, re.I)
+            if m:
+                section = m.group(1).lower()
+                d[section] = m.group(2).strip()
+                continue
+            if section in ("repro", "notes") and line.strip():
+                d[section] += (" " if d[section] else "") + line.strip()
+        findings.append(d)
+    # dedup by repro signature
+    seen, out = set(), []
+    for f in findings:
+        sig = re.sub(r"\W+", "", f["repro"].lower())[:120]
+        if sig and sig in seen:
+            continue
+        seen.add(sig)
+        out.append(f)
+    return out
+
+
+def print_report(run_dir: Path, plan: list[dict], hunter_results: list[dict]):
+    findings = load_findings(run_dir)
+    print("\n[break] hunter results")
+    for r in hunter_results:
+        print(f"  #{r['id']} {r['kind']:<28} {r['status']:<14} "
+              f"{r['findings']} finding(s) in {r['secs']}s")
+    if not findings:
+        print("\nNo findings. The repo held up (this round).")
+        return 0
+    order = {"high": 0, "medium": 1, "low": 2}
+    findings.sort(key=lambda f: order.get(f["severity"], 3))
+    print(f"\n[break] {len(findings)} finding(s) — details in {run_dir}/findings/\n")
+    for i, f in enumerate(findings, 1):
+        v = "VERIFIED" if f["verified"].lower().startswith("y") else "suspected"
+        print(f"  {i}. [{f['severity']}/{v}] {f['file']}")
+        if f["repro"]:
+            print(f"     repro: {f['repro'][:90]}")
+    return 1
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="break", description="Spawn pi agents to break a repo.")
+    ap.add_argument("target", nargs="?", default=".", help="repo path (default: cwd)")
+    ap.add_argument("prompt", nargs="?", default=None, help="free-text focus hint")
+    ap.add_argument("--focus", default=None, help="focus hint (same as positional prompt)")
+    ap.add_argument("--commit", default=None, help="attack repo at this commit (own worktree)")
+    ap.add_argument("--diff", default=None, help="attack what RANGE changed, e.g. main..HEAD")
+    ap.add_argument("--last-commit", action="store_true", help="sugar for --diff HEAD~1..HEAD")
+    ap.add_argument("--n", type=int, default=0, help="hunter count (default: one per bug class)")
+    ap.add_argument("--model", default=None, help="pi model pattern (default: pi's default)")
+    ap.add_argument("--timeout-mins", type=int, default=20, help="per-agent timeout (default 20)")
+    ap.add_argument("--dry-run", action="store_true", help="show plan, spawn nothing")
+    ap.add_argument("--report", default=None, metavar="RUN_ID", help="re-show a past run")
+    ap.add_argument("--list", action="store_true", help="list past runs")
+    args = ap.parse_args()
+
+    if args.list:
+        if RUNS_DIR.exists():
+            for d in sorted(RUNS_DIR.iterdir()):
+                print(d.name)
+        return
+    if args.report:
+        run_dir = RUNS_DIR / args.report
+        if not run_dir.exists():
+            die(f"no such run: {args.report}")
+        plan = json.loads((run_dir / "plan.json").read_text())
+        sys.exit(print_report(run_dir, plan, json.loads((run_dir / "hunters.json").read_text())))
+
+    root = repo_root(Path(args.target).resolve())
+    focus = args.focus or args.prompt
+    if args.last_commit:
+        args.diff = "HEAD~1..HEAD"
+
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + root.name
+    run_dir = RUNS_DIR / run_id
+    findings_dir = run_dir / "findings"
+    run_dir.mkdir(parents=True)
+
+    wt, ref_desc = resolve_worktree(root, args.commit, args.diff)
+    target = wt if wt != root else root
+    print(f"[break] target: {root.name} @ {ref_desc}")
+    if wt != root:
+        print(f"[break] worktree: {wt}")
+
+    classes = run_triage(target, focus, args.model, args.timeout_mins)
+    if not classes:
+        die("triage produced no bug classes (check model output)")
+    n = args.n or len(classes)
+    plan = build_plan(classes, n)
+    (run_dir / "plan.json").write_text(json.dumps(
+        {"run_id": run_id, "repo": str(root), "ref": ref_desc, "target": str(target),
+         "focus": focus, "classes": classes, "plan": plan}, indent=2))
+    show_plan(plan)
+    print(f"\n[break] run: {run_id}  ({len(plan)} hunters)")
+    if args.dry_run:
+        print("[break] dry-run: stopping before spawn. Logs/triage: " + str(run_dir))
+        return
+
+    findings_dir.mkdir()
+    print(f"[break] spawning {len(plan)} hunters (timeout {args.timeout_mins}m each) ...\n")
+    with __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(max_workers=len(plan)) as ex:
+        results = list(ex.map(lambda h: run_hunter(h, target, findings_dir, args.model,
+                                                   args.timeout_mins, focus), plan))
+    (run_dir / "hunters.json").write_text(json.dumps(results, indent=2))
+    print(f"[break] run dir: {run_dir}")
+    sys.exit(print_report(run_dir, plan, results))
+
+
+if __name__ == "__main__":
+    main()
