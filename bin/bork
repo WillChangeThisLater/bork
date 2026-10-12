@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 BORK_HOME = Path(os.environ.get("BORK_HOME", Path.home() / ".bork"))
+EPHEMERAL = False  # set by main(): --ephemeral => spawn pi with --no-session
 RUNS_DIR = BORK_HOME / "runs"
 WORKTREES_DIR = BORK_HOME / "worktrees"
 LEDGER_DIR = BORK_HOME / "ledger"
@@ -110,7 +111,11 @@ def run_triage(target: Path, focus: str | None, model: str | None, timeout: int,
     # structured output: force a validated JSON result instead of regex-parsing prose
     schema_file = BORK_HOME / "triage-schema.json"
     schema_file.write_text(json.dumps(TRIAGE_SCHEMA))
-    cmd = ["pi", "-p", "--no-session", "--schema", str(schema_file)]
+    cmd = ["pi", "-p", "--schema", str(schema_file)]
+    if not EPHEMERAL:
+        cmd += ["--name", f"bork triage {target.name}"]
+    else:
+        cmd += ["--no-session"]
     if model:
         cmd += ["--model", model]
     prompt = TRIAGE_CONTRACT.format(n_classes=n_classes) + f"\nRepository to analyze: {target}\n"
@@ -358,7 +363,12 @@ def run_hunter(h: dict, target: Path, findings_dir: Path, model: str | None,
         prompt += f"Focus areas: {h['where']}\n"
     if focus:
         prompt += f"User's focus hint: {focus}\n"
-    cmd = ["pi", "-p", "--no-session", "--mode", "json"]
+    brief_short = re.sub(r"\s+", " ", h["brief"]).strip()[:60]
+    cmd = ["pi", "-p", "--mode", "json"]
+    if not EPHEMERAL:
+        cmd += ["--name", f"bork hunt #{h['id']} {h['kind']}: {brief_short}"]
+    else:
+        cmd += ["--no-session"]
     if model:
         cmd += ["--model", model]
     cmd += ["--", prompt]
@@ -436,6 +446,30 @@ class Fmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFor
     pass
 
 
+def prune_bork_sessions(max_age_days: float = 7.0, enabled: bool = True):
+    if not enabled:
+        return
+    """Delete old pi session files for bork agents (they carry `--name bork ...`).
+
+    Session filenames embed the random session id, not the --name, so we
+    grep file contents for the bork session_info entry.
+    """
+    cutoff = time.time() - max_age_days * 86400
+    sessions = Path.home() / ".pi" / "agent" / "sessions"
+    if not sessions.exists():
+        return
+    for f in sessions.glob("*/*.jsonl"):
+        try:
+            if f.stat().st_mtime >= cutoff:
+                continue
+            with f.open("rb") as fh:
+                head = fh.read(65536)
+            if b'"type":"session_info"' in head and b'"name":"bork ' in head:
+                f.unlink()
+        except OSError:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser(
     prog="bork",
@@ -464,10 +498,17 @@ def main():
     ap.add_argument("--timeout-mins", type=int, default=20, help="per-agent timeout (default 20)")
     ap.add_argument("--dry-run", action="store_true", help="show plan, spawn nothing")
     ap.add_argument("--fresh", action="store_true", help="ignore known-findings ledger")
+    ap.add_argument("--ephemeral", action="store_true",
+                    help="spawn agents with --no-session (no logs on disk, agent ls shows "
+                         "them as ephemeral-<pid> only; the old default)")
+    ap.add_argument("--keep-sessions", action="store_true",
+                    help="never prune old bork session logs (default: prune after 7 days)")
     ap.add_argument("--ledger", action="store_true", help="print the repo's known-findings ledger")
     ap.add_argument("--report", default=None, metavar="RUN_ID", help="re-show a past run")
     ap.add_argument("--list", action="store_true", help="list past runs")
     args = ap.parse_args()
+    global EPHEMERAL
+    EPHEMERAL = args.ephemeral
 
     if args.list:
         if RUNS_DIR.exists():
@@ -536,6 +577,7 @@ def main():
     findings = load_findings(run_dir)
     append_run_to_ledger(root, run_id, findings)
     print(f"[bork] run dir: {run_dir}")
+    prune_bork_sessions(enabled=not args.keep_sessions)
     sys.exit(print_report(run_dir, plan, results))
 
 
